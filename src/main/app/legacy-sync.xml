@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:batch="http://www.mulesoft.org/schema/mule/batch" xmlns:db="http://www.mulesoft.org/schema/mule/db" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:data-mapper="http://www.mulesoft.org/schema/mule/ee/data-mapper" xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" 
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/ee/data-mapper http://www.mulesoft.org/schema/mule/ee/data-mapper/current/mule-data-mapper.xsd
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd
+http://www.mulesoft.org/schema/mule/batch http://www.mulesoft.org/schema/mule/batch/current/mule-batch.xsd">
+    <http:listener-config name="HTTP_Listener_Configuration" host="0.0.0.0" port="8081" doc:name="HTTP Listener Configuration"/>
+    <db:mysql-config name="MySQL_Configuration" host="localhost" port="3306" user="const" password="const" database="construction_machines" doc:name="MySQL Configuration"/>
+    <http:request-config name="HTTP_Request_Configuration" host="localhost" port="7474"  doc:name="HTTP Request Configuration" >
+        <http:basic-authentication username="neo4j" password="blog"/>
+    </http:request-config>
+    <flow name="legacy-syncFlow3">
+        <http:listener config-ref="HTTP_Listener_Configuration" path="/sync" doc:name="HTTP"/>
+        <flow-ref name="backend-sync-mysql-neo4j" doc:name="backend-sync-mysql-neo4j"/>
+    </flow>
+    <flow name="legacy-syncFlow">
+        <poll doc:name="Poll">
+            <fixed-frequency-scheduler frequency="3000"/>
+            <flow-ref name="backend-sync-mysql-neo4j" doc:name="backend-sync-mysql-neo4j"/>
+        </poll>
+        <logger level="INFO" doc:name="Logger"/>
+    </flow>
+    <flow name="backend-sync-mysql-neo4j" processingStrategy="synchronous">
+        
+            <batch:execute name="sync-parts-batch" doc:name="Sync Parts"/>
+            <batch:execute name="sync-suppliers-batch" doc:name="Sync Suppliers"/>
+            <batch:execute name="sync-relationship-batch" doc:name="Sync Part Relationships"/>
+            <batch:execute name="sync-suppliers-part-relationship" doc:name="Sync Suppliers Part Relationship"/>
+        
+    </flow>
+    <batch:job name="sync-parts-batch">
+        <batch:input>
+            <db:select config-ref="MySQL_Configuration" doc:name="Query all parts">
+                <db:parameterized-query><![CDATA[select * from item;]]></db:parameterized-query>
+            </db:select>
+        </batch:input>
+        <batch:process-records>
+            <batch:step name="Batch_Step">
+                <batch:set-record-variable variableName="neoquery" value="#[&quot;merge(:Part {itemId:&quot;+ payload.item_id +&quot;, itemName: '&quot;+ payload.item_name +&quot;', priceEuro:&quot; + payload.?price_euro + &quot;, priceUSD:&quot;+ payload.?price_usd + &quot;})&quot; ]" doc:name="build neo4j merge query"/>
+                <set-payload value="{ &quot;statements&quot; : [ { &quot;statement&quot; : &quot;#[recordVars.neoquery]&quot; } ] }" doc:name="set neo4j query as json payload"/>
+                <logger message="neo4j query: #[payload]" level="INFO" doc:name="Logger"/>
+                <flow-ref name="neo4j-cypher-api" doc:name="neo4j-cypher-api"/>
+            </batch:step>
+        </batch:process-records>
+        <batch:on-complete>
+            <logger level="INFO" doc:name="Logger" message="#[payload]"/>
+        </batch:on-complete>
+    </batch:job>
+    <batch:job name="sync-relationship-batch">
+        <batch:input>
+            <db:select config-ref="MySQL_Configuration" doc:name="Query all part relationships">
+                <db:parameterized-query><![CDATA[Select a.item_id as 'Item_ID', a.item_name as 'Item_Name', c.item_id as 'Dep_Item_ID', c.item_name as 'Dep_Item_Name', b.level from item a, item_hierarchy b, item c where a.item_id = b.parent_item_id and b.item_id = c.item_id;]]></db:parameterized-query>
+            </db:select>
+        </batch:input>
+        <batch:process-records>
+            <batch:step name="Batch_Step1">
+                <batch:set-record-variable variableName="neoquery" value="#[ &quot;match (n:Part), (o:Part) where n.itemId=&quot;+ payload.Item_ID + &quot; and o.itemId= &quot; + payload.Dep_Item_ID + &quot; with n,o merge (o)-[:belongsTo]-&gt;(n)&quot; ]" doc:name="build neo4j relationship query"/>
+                <set-payload value="{ &quot;statements&quot; : [ { &quot;statement&quot; : &quot;#[recordVars.neoquery]&quot; } ] }" doc:name="set neo4j query as json payload"/>
+                <logger message="neo4j query: #[payload]" level="INFO" doc:name="Logger"/>
+                <flow-ref name="neo4j-cypher-api" doc:name="neo4j-cypher-api"/>
+            </batch:step>
+        </batch:process-records>
+        <batch:on-complete>
+            <logger message="#[payload]" level="INFO" doc:name="Logger"/>
+        </batch:on-complete>
+    </batch:job>
+    <batch:job name="sync-suppliers-part-relationship">
+        <batch:input>
+            <db:select config-ref="MySQL_Configuration" doc:name="Query supplier part relationship">
+                <db:parameterized-query><![CDATA[select sup.supplier_id, sup.supplier_name, its.item_id from suppliers sup left outer join item_supplier its on  sup.supplier_id = its.supplier_id;]]></db:parameterized-query>
+            </db:select>
+        </batch:input>
+        <batch:process-records>
+            <batch:step name="Batch_Step3">
+                <batch:set-record-variable variableName="neoquery" value="#[&quot;match (s:Supplier), (p:Part) where s.supplierId =&quot;+ payload.supplier_id +&quot; and p.itemId= &quot;+payload.item_id+&quot; with s,p merge (s)-[:delivers]-&gt;(p)&quot;]" doc:name="build neo4j supplier part relationship query"/>
+                <set-payload value="{ &quot;statements&quot; : [ { &quot;statement&quot; : &quot;#[recordVars.neoquery]&quot; } ] }" doc:name="set neo4j query as json payload"/>
+                <logger message="neo4j query: #[payload]" level="INFO" doc:name="Logger"/>
+                <flow-ref name="neo4j-cypher-api" doc:name="neo4j-cypher-api"/>
+            </batch:step>
+        </batch:process-records>
+        <batch:on-complete>
+            <logger message="#[payload]" level="INFO" doc:name="Logger"/>
+        </batch:on-complete>
+    </batch:job>
+    <batch:job name="sync-suppliers-batch">
+        <batch:input>
+            <db:select config-ref="MySQL_Configuration" doc:name="Query all suppliers">
+                <db:parameterized-query><![CDATA[select * from suppliers;]]></db:parameterized-query>
+            </db:select>
+        </batch:input>
+        <batch:process-records>
+            <batch:step name="Batch_Step2">
+                <batch:set-record-variable variableName="neoquery" value="#[ &quot;merge (:Supplier {supplierId:&quot; +payload.supplier_id+&quot; ,supplierName:'&quot;+payload.supplier_name+&quot;', supplierLocation:'&quot;+payload.supplier_address+&quot;'})&quot; ]" doc:name="build neo4j supplier creation query"/>
+                <set-payload value="{ &quot;statements&quot; : [ { &quot;statement&quot; : &quot;#[recordVars.neoquery]&quot; } ] }" doc:name="set neo4j query as json payload"/>
+                <logger message="neo4j query: #[payload]" level="INFO" doc:name="Logger"/>
+                <flow-ref name="neo4j-cypher-api" doc:name="neo4j-cypher-api"/>
+            </batch:step>
+        </batch:process-records>
+        <batch:on-complete>
+            <logger message="#[payload]" level="INFO" doc:name="Logger"/>
+        </batch:on-complete>
+    </batch:job>
+    <sub-flow name="neo4j-cypher-api">
+        <http:request config-ref="HTTP_Request_Configuration" path="db/data/transaction/commit" method="POST" doc:name="neo4j single transaction cyper callout">
+            <http:request-builder>
+                <http:header headerName="Accept" value="application/json; charset=UTF-8"/>
+                <http:header headerName="Content-Type" value="application/json"/>
+                <http:header headerName="Authorization" value="Basic bmVvNGo6YmxvZw=="/>
+            </http:request-builder>
+        </http:request>
+        <object-to-string-transformer doc:name="Object to String"/>
+        <logger message="#[payload]" level="INFO" doc:name="Logger"/>
+    </sub-flow>
+</mule>
